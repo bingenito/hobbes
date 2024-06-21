@@ -2,11 +2,6 @@
 #ifndef HOBBES_UTIL_LLVM_HPP_INCLUDED
 #define HOBBES_UTIL_LLVM_HPP_INCLUDED
 
-#include <hobbes/util/array.H>
-#if LLVM_VERSION_MAJOR >= 11
-#include <hobbes/lang/type.H>
-#endif
-
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wold-style-cast"
 #pragma GCC diagnostic ignored "-Wunused-parameter"
@@ -18,20 +13,29 @@
 #error "I don't know how to use this version of LLVM"
 #endif
 
+#include <hobbes/lang/type.H>
+#include <hobbes/util/ptr.H>
+#include <hobbes/util/array.H>
+
+#if LLVM_VERSION_MAJOR >= 11
+#include <hobbes/lang/type.H>
+#endif
+
+#include <llvm/Analysis/Passes.h>
+#include <llvm/IR/DataLayout.h>
 #include <llvm/IR/DerivedTypes.h>
+#include <llvm/IR/Function.h>
+#include <llvm/IR/InstIterator.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
-#include <llvm/IR/DataLayout.h>
-#include <llvm/IR/InstIterator.h>
-#include <llvm/Analysis/Passes.h>
-#include <llvm/Transforms/Scalar.h>
-#include <llvm/Transforms/Vectorize.h>
-#include <llvm/Transforms/IPO.h>
-#include <llvm/Transforms/Utils/Cloning.h>
-#include <llvm/Support/TargetSelect.h>
-#include <llvm/Support/TargetRegistry.h>
 #include <llvm/Support/Signals.h>
+#include <llvm/Support/TargetRegistry.h>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Transforms/IPO.h>
+#include <llvm/Transforms/Scalar.h>
+#include <llvm/Transforms/Utils/Cloning.h>
+#include <llvm/Transforms/Vectorize.h>
 #if LLVM_VERSION_MAJOR == 4 || LLVM_VERSION_MAJOR == 6 || LLVM_VERSION_MAJOR <= 8
 #  include <llvm/Bitcode/BitstreamReader.h>
 #  include <llvm/Bitcode/BitstreamWriter.h>
@@ -67,6 +71,12 @@ namespace hobbes {
 
 using int128_t = __int128;
 
+#define INT128_TO_UINT64_ARRAY_REF_NAMED_a_a_a(x)                              \
+  const uint64_t aa_aa_aa[] = {                                                \
+      static_cast<uint64_t>(static_cast<unsigned __int128>(x) &                \
+                            0xFFFFFFFFFFFFFFFF),                               \
+      static_cast<uint64_t>(static_cast<unsigned __int128>(x) >> 64U)};        \
+  const auto a_a_a = llvm::ArrayRef<uint64_t> { aa_aa_aa }
 
 #if LLVM_VERSION_MAJOR >= 11
 inline llvm::orc::ThreadSafeContext& threadSafeContext() {
@@ -217,7 +227,8 @@ inline llvm::Constant* cvalue(long x) {
 }
 
 inline llvm::Constant* cvalue(int128_t x) {
-  return llvm::Constant::getIntegerValue(int128Type(), llvm::APInt(128, x, true));
+  INT128_TO_UINT64_ARRAY_REF_NAMED_a_a_a(x);
+  return llvm::Constant::getIntegerValue(int128Type(), llvm::APInt(128, a_a_a));
 }
 
 inline llvm::Constant* cvalue(float x) {
@@ -275,7 +286,8 @@ inline llvm::ConstantInt* civalue(long x) {
 
 inline llvm::ConstantInt* civalue(int128_t x) {
   return withContext([x](llvm::LLVMContext& c) {
-    return llvm::ConstantInt::get(llvm::IntegerType::get(c, 128), x); // static_cast<uint64_t>(x));
+    INT128_TO_UINT64_ARRAY_REF_NAMED_a_a_a(x);
+    return llvm::ConstantInt::get(c, llvm::APInt(128, a_a_a));
   });
 }
 #else
@@ -430,7 +442,8 @@ inline llvm::Constant* cvalue(long x) {
 }
 
 inline llvm::Constant* cvalue(int128_t x) {
-  return llvm::Constant::getIntegerValue(int128Type(), llvm::APInt(128, x, true));
+  INT128_TO_UINT64_ARRAY_REF_NAMED_a_a_a(x);
+  return llvm::Constant::getIntegerValue(int128Type(), llvm::APInt(128, a_a_a));
 }
 
 inline llvm::Constant* cvalue(float x) {
@@ -471,10 +484,14 @@ inline llvm::ConstantInt* civalue(long x) {
 }
 
 inline llvm::ConstantInt* civalue(int128_t x) {
-  return llvm::ConstantInt::get(llvm::IntegerType::get(context(), 128), x); //static_cast<uint64_t>(x));
+  INT128_TO_UINT64_ARRAY_REF_NAMED_a_a_a(x);
+  return llvm::ConstantInt::get(context(), llvm::APInt(128, a_a_a));
 }
 
 #endif
+
+#undef INT128_TO_UINT64_ARRAY_REF_NAMED_a_a_a
+
 // an intermediate representation for records
 using FieldValue = std::pair<std::string, llvm::Value *>;
 using RecordValue = std::vector<FieldValue>;
@@ -832,6 +849,44 @@ inline llvm::Value* fncall(llvm::IRBuilder<>* b, llvm::Value* fn, llvm::Type* tf
   return fncall(b, fn, tfn, list(arg));
 }
 
-}
+inline void maybeInlineFunctionsIn(llvm::Module& m) {
+  // If there is an IR function in current module is already large (instructions
+  // > `HOBBES_FUNCTION_INLINE_THRESHOLD`), then keep inlining it makes it even
+  // larger, 10x larger. We simply stop applying FunctionInlining pass on this
+  // module in such kinds of scenario.
+  static const auto allFunctionsAreSmall = [](const llvm::Module& m) {
+    static unsigned fnInliningThreshold = [] {
+      const char* v = std::getenv("HOBBES_FUNCTION_INLINE_THRESHOLD");
+      if (v == nullptr) {
+        return 30'000U; // arbitrarily chosen, but should be conservative enough
+      }
+      return static_cast<unsigned>(strtoul(v, nullptr, 10));
+    }();
 
+    // early llvm versions either don't have
+    // llvm::Function::getInstructionCount() or failed to make it const, so we
+    // provide our simplified version
+    static const auto getFunctionInstructionCount =
+        [](const llvm::Function& f) {
+          unsigned num = 0;
+          for (const auto& b : f.getBasicBlockList()) {
+            num += b.size();
+          }
+          return num;
+        };
+
+    // if any functions in this module has instruction number above threshold,
+    // then should not inline anything
+    return std::none_of(m.begin(), m.end(), [](const llvm::Function& f) {
+      return getFunctionInstructionCount(f) > fnInliningThreshold;
+    });
+  };
+
+  if (allFunctionsAreSmall(m)) {
+    auto mpm = llvm::legacy::PassManager();
+    mpm.add(llvm::createFunctionInliningPass());
+    mpm.run(m);
+  }
+}
+}
 #endif
